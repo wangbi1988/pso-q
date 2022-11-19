@@ -13,10 +13,6 @@ from typing import Set
 
 import numpy as np
 import tensorflow as tf
-if not tf.__version__.startswith('1'):
-    import tensorflow.compat.v1 as tf
-    tf.disable_v2_behavior()
-
 
 
 def is_image(tensor):
@@ -96,6 +92,38 @@ def huber_loss(tensor, delta=1.0):
         tf.square(tensor) * 0.5,
         delta * (tf.abs(tensor) - 0.5 * delta)
     )
+
+# @tf.function
+# def inv_huber_loss(tensor, delta1=1.0, delta2 = 1e-2):
+#     """
+#     Reference: https://en.wikipedia.org/wiki/Huber_loss
+
+#     :param tensor: (TensorFlow Tensor) the input value
+#     :param delta: (float) Huber loss delta value
+#     :return: (TensorFlow Tensor) Huber loss output
+#     """
+#     return tf.where(
+#         tf.abs(tensor) < delta1,
+#         tf.where(tf.abs(tensor) < delta2,
+#                  tf.abs(tensor),
+#                  tf.sqrt(tf.abs(tensor)) * 2.),
+#         tf.square(tensor) * 0.5,
+#     )
+@tf.function
+def inv_huber_loss(tensor, delta1=1.0, delta2 = 1e-2):
+    """
+    Reference: https://en.wikipedia.org/wiki/Huber_loss
+
+    :param tensor: (TensorFlow Tensor) the input value
+    :param delta: (float) Huber loss delta value
+    :return: (TensorFlow Tensor) Huber loss output
+    """
+    return tf.where(
+        tf.abs(tensor) < delta1,
+        tf.abs(tensor),
+        tf.square(tensor) * 0.5,
+    )
+
 
 
 def sample(logits):
@@ -198,7 +226,7 @@ def make_session(num_cpu=None, make_default=False, graph=None):
     :return: (TensorFlow session)
     """
     if num_cpu is None:
-        num_cpu = int(os.getenv('RCALL_NUM_CPU', multiprocessing.cpu_count()))
+        num_cpu = min(int(os.getenv('RCALL_NUM_CPU', multiprocessing.cpu_count())), 8)
     tf_config = tf.ConfigProto(
         allow_soft_placement=True,
         inter_op_parallelism_threads=num_cpu,
@@ -527,3 +555,29 @@ def total_episode_reward_logger(rew_acc, rewards, masks, writer, steps):
                 rew_acc[env_idx] = sum(rewards[env_idx, dones_idx[-1, 0]:])
 
     return rew_acc
+
+
+def scale_action(action_space, action):
+    """
+    Rescale the action from [low, high] to [-1, 1]
+    (no need for symmetric action space)
+
+    :param action_space: (gym.spaces.box.Box)
+    :param action: (np.ndarray)
+    :return: (np.ndarray)
+    """
+    low, high = action_space.low, action_space.high
+    return 2.0 * ((action - low) / (high - low)) - 1.0
+
+
+def unscale_action(action_space, scaled_action):
+    """
+    Rescale the action from [-1, 1] to [low, high]
+    (no need for symmetric action space)
+
+    :param action_space: (gym.spaces.box.Box)
+    :param action: (np.ndarray)
+    :return: (np.ndarray)
+    """
+    low, high = action_space.low, action_space.high
+    return low + (0.5 * (scaled_action + 1.0) * (high - low))
