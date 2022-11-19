@@ -5,26 +5,18 @@ Created on Tue Jun 16 11:00:47 2020
 @author: bb
 """
 
-from . import tf_util, approximatedAgent, CountBasedList, observation_input, ReplayBuffer;
+from . import tf_util, approximatedAgent, CountBasedList, observation_input, ReplayBuffer, def_dtype;
 
 import numpy as np;
 import tensorflow as tf;
-
-if not tf.__version__.startswith('1'):
-    import tensorflow.compat.v1 as tf
-    tf.disable_v2_behavior()
-    import tensorflow.keras.layers as tf_layers
-    import tf_slim as slim;
-    import tensorflow.keras.initializers as initializers
-else:
-    import tensorflow.contrib.slim as slim;
-    import tensorflow.contrib.layers as tf_layers;
-    from tensorflow.contrib.layers.python.layers import initializers;
-
-
+import tensorflow.contrib.slim as slim;
+import tensorflow.contrib.layers as tf_layers;
+from tensorflow.contrib.layers.python.layers import initializers;
+from stable_baselines.common.mpi_adam import MpiAdam;
 
 import marshal;
 import multiprocessing;
+
 
 class DeepAgentContinuous(approximatedAgent):
     def __init__(self, obsSpace, actionSpace, act_bounds, pso, config = None,
@@ -34,10 +26,10 @@ class DeepAgentContinuous(approximatedAgent):
                  n_cpu_tf_sess = None, verbose = 0, output_graph = True,
                  scale = True, grad_norm_clipping = None, obsmap_layers = (24, ), qnet_layers = (12, ),
                  countbased_features = 12, name = 'dqn', init_seed = None,
-                 K = 1,
+                 K = 1, copy_mode = 'soft', tau = 1e-3,
                  ):
         super(DeepAgentContinuous, self).__init__(obsSpace, actionSpace);
-        self.act_bounds = act_bounds;
+        self.act_bounds = np.asarray(act_bounds);
         self.pso = pso;
         self.gamma = gamma;
         self.learning_starts = learning_starts;
@@ -46,6 +38,9 @@ class DeepAgentContinuous(approximatedAgent):
         self.target_network_update_freq = target_network_update_freq;
         self.replay_buffer = None if buffer_tol_size is None else ReplayBuffer(buffer_tol_size);
         self.buffer_size = batch_size;
+        
+        self.tau = tau;
+        self.copy_mode = copy_mode;
         
         self.K = K;
                 
@@ -102,39 +97,54 @@ class DeepAgentContinuous(approximatedAgent):
     def lookup(self, obs):
         assert hasattr(obs, '__iter__'), 'obs in tabular agent need be iterable'
         state, action =  obs;
-        qvalue = self.x2q_func(state, action, sess = self.sess)[0];
+        qvalue = self.x2q_func(state, action, sess = self.sess)[0][0];
         return qvalue, state;
         
-    def update(self, trajectories, gamma, *params, lr_factor = 1.0, **args):
+    def update(self, trajectories, gamma, *params, lr_factor = None, **args):
         trajectory = trajectories[-1];
+        if lr_factor is None:
+            lr_factor = self.learning_rate;
         (obses_t, actions), rewards, (obses_tp1, actions_tp1), dones = trajectory.values;
         if self.replay_buffer is not None:
-            self.replay_buffer.add(obses_t[0], actions[0], rewards[0], obses_tp1[0], actions_tp1[0], float(dones[0]));
-        if dones:
-            self.episode_leng.append(self.learn_step_counter - self.learn_step_counter_pre);
-            self.learn_step_counter_pre = self.learn_step_counter;
-#        exp-replay
+            for ot, at, r, otp, atp, d in zip((obses_t, actions, rewards, 
+                                            obses_tp1, actions_tp1, dones)):
+                self.replay_buffer.add(ot, at, r, otp, atp, float(d));
+                
+        weighted_error = None;
+        can_copy_net_work = False;
         if self.learn_step_counter >= self.learning_starts:
             if self.learn_step_counter % self.train_freq == 0:
                 can_sample = self.replay_buffer.can_sample(self.buffer_size) if self.replay_buffer is not None else True;
                 if can_sample:
                     experience = self.replay_buffer.sample(self.buffer_size) if self.replay_buffer is not None else (
-                            obses_t, actions, rewards, obses_tp1, actions_tp1, np.asarray(dones, dtype = np.float32));
-                    self._do_update(experience, *params,  **args);
+                            obses_t, actions, rewards, obses_tp1, actions_tp1, np.asarray(dones));
+                    q_target_values, weighted_error = self._do_update(experience, lr_factor, *params,  **args);
+                    actions_tp1 = [q_target_values];
             if (self.target_network_update_freq > 0) and (self.learn_step_counter % self.target_network_update_freq == 0):
-                self.copy_net_func(sess = self.sess);
+                can_copy_net_work = True;
+                self.copy_net_func(sess = self.sess)
         self.learn_step_counter += 1;
-        return actions_tp1[0];
+        return actions_tp1[0], weighted_error, can_copy_net_work;
     
-    def _do_update(self, experience, *params,  **args):
+    def _do_update(self, experience, lr_factor, *params, **args):
         obses_t, actions, rewards, obses_tp1, acts_1, dones = experience;
-        ret = self.train_func(obses_t, actions, rewards, obses_tp1, acts_1, dones, *params, sess=self.sess, **args);
-        td_error, weighted_error, q_t_selected, q_t_selected_target, gradients = ret
-#        print('weighted_error', weighted_error)
-#        print('q_t_selected', q_t_selected)
-#        print('q_t_selected_target', q_t_selected_target)
-#        print('td_error', td_error)
-        return ret;         
+        ret = self.train_func(obses_t, actions, rewards, 
+                              obses_tp1, acts_1, dones, lr_factor,
+                              *params, sess=self.sess, **args);
+        
+        td_error, weighted_error, global_particle, global_eval, gradients = ret
+        
+        # self.optimizer_outer.update(gradients, learning_rate = lr_factor);
+        
+        # q_target_values = np.asarray([g[idx, :] for g, idx in zip(global_particle, np.argmax(global_eval, axis = 1))])
+        # if weighted_error >= 5:
+            # print(td_error, q_t_selected, q_t_selected_target)
+            # print('r', experience[2])
+            # print('weighted_error', weighted_error)
+            # print('q_t_selected', q_t_selected)
+            # print('q_t_selected_target', q_t_selected_target)
+            # print('td_error', td_error)
+        return None, weighted_error;         
     
     def episode_done(self, trajectories):
         pass;
@@ -143,10 +153,7 @@ class DeepAgentContinuous(approximatedAgent):
     def pi(self, obs, judge, *params, **args):
         prob, acts = self.behavior_policy(obs, judge, * params, **args);
         idx = DeepAgentContinuous.choice_v1(len(prob), size = 1, p = prob);
-        act = acts[idx, :];
-#        act = [([act[i]] if np.random.random() > args['eps_ph']\
-#                else (np.random.random(len(self.act_bounds[0]))) * (self.act_bounds[1] - self.act_bounds[0]) + self.act_bounds[0]) for i in range(len(obs))];
-#        act = np.reshape(np.asarray(act), newshape = (len(obs) * len(self.act_bounds[0])));
+        act = [acts[ii, int(i)] for ii, i in enumerate(idx)];
         return act;
     
     def decide(self, obs, *params, **args):
@@ -161,16 +168,18 @@ class DeepAgentContinuous(approximatedAgent):
         return action
     
     def behavior_policy(self, obs, judge, *params, **args):
-        return self.target_policy_probability(obs, judge, *params, **args);
+        ff = self.target_policy_probability(obs, judge, *params, **args);
+        return ff;
     
     def target_policy_probability(self, obs, judge, *params, **args):
         return self.config.judge(self.pred_prob_op, self.sess, 
                                  feed_dict = {self._test_obs_ph: obs}, 
-                                 prob_ph = np.ones(shape = (len(obs), self.K)) / self.K, 
+                                 prob_ph = np.ones(shape = (len(obs), self.pred_prob_op[0].shape[1])) / self.K, 
                                  **args);
         
     def setup_model(self):
-        self.graph = tf.Graph()
+        tf.reset_default_graph();
+        self.graph = tf.Graph();
         with self.graph.as_default():
             self.sess = tf_util.make_session(num_cpu = self.n_cpu_tf_sess, graph = self.graph);
             
@@ -186,15 +195,15 @@ class DeepAgentContinuous(approximatedAgent):
                                                                         scale = self.scale, name = "batch_nact");
                 
                 
-                self._rew_ph = tf.placeholder(tf.float32, [self.batch_size], name="batch_reward");
+                self._rew_ph = tf.placeholder(def_dtype, [self.batch_size], name="batch_reward");
                 self._processed_rew_ph = tf.reshape(self._rew_ph, shape = (self.batch_size, 1));
                                                                             
-                self._done_mask_ph = tf.placeholder(tf.float32, [self.batch_size], name="done");
+                self._done_mask_ph = tf.placeholder(def_dtype, [self.batch_size], name="done");
                 self._processed_done_mask_ph = tf.reshape(self._done_mask_ph, shape = (self.batch_size, 1));
             
-                self._test_obs_ph, self._test_processed_obs = observation_input(self.obsSpace, 1, 
+                self._test_obs_ph, self._test_processed_obs = observation_input(self.obsSpace, self.batch_size, 
                                                                       scale = self.scale, name = "test_ob");
-                self._test_act_ph, self._test_processed_act = observation_input(self.actionSpace, 1, 
+                self._test_act_ph, self._test_processed_act = observation_input(self.actionSpace, self.batch_size, 
                                                                       scale = self.scale, name = "test_act");
                                                                                 
                                                                                 
@@ -212,14 +221,15 @@ class DeepAgentContinuous(approximatedAgent):
             
             self.global_particle, self.global_eval = self._buildPSO(self.pso, 
                                                                     (self._test_obs_ph, self._test_processed_obs), 
-                                                                    1, maxiter = 5, N = 20, k = self.K);
+                                                                    self.batch_size, maxiter = 10, 
+                                                                    N = 100, k = self.K);
             print('global_particle', self.global_particle, self.global_eval)
             
             self.nglobal_particle, self.nglobal_eval = self._buildPSO(self.pso, 
                                                                       (self._nobs_ph, self._nprocessed_obs),
                                                                       self.batch_size, 
                                                                       targetNet = True,
-                                                                      maxiter = 20, N = 50, k = self.K);
+                                                                      maxiter = 10, N = 200, k = self.K);
                                                                          
             print('nglobal_particle', self.nglobal_particle, self.nglobal_eval);
             self.pred_prob_op = self._setup_policy((self.global_particle, self.global_eval));
@@ -229,18 +239,23 @@ class DeepAgentContinuous(approximatedAgent):
             print('buliding loss begin......');
             self.train_func = self._setup_loss();
             
-#            self.copy_net_func = self._setup_copy();
-            self.copy_net_func = self._setup_soft_update();
+            self.soft_copy_net_func = self._setup_soft_update(tau = self.tau);
+            self.hard_copy_net_func = self._setup_copy();
+            if self.copy_mode == 'soft':
+                self.copy_net_func = self.soft_copy_net_func;
+            else:
+                self.copy_net_func = self.hard_copy_net_func;
 
             tf_util.initialize(self.sess);
-            self.copy_net_func(sess = self.sess);
+            self.optimizer_outer.sync()
+            self.hard_copy_net_func(sess = self.sess);
             
-            save_path = 'ckpt/ckpt';
-            writer = tf.summary.FileWriter(save_path);
-            writer.add_graph(self.graph);
+            # save_path = 'ckpt/ckpt';
+            # writer = tf.summary.FileWriter(save_path);
+            # writer.add_graph(self.graph);
     
     
-    def _bulid_training_scheme(self, inputs, reuse = False, name = 't1'):
+    def _bulid_training_scheme(self, inputs, reuse = False, name = 't1', targetNet = True):
         (_obs_ph, _processed_obs, 
          _nobs_ph, _nprocessed_obs, 
          _act_ph, _processed_act, 
@@ -253,22 +268,27 @@ class DeepAgentContinuous(approximatedAgent):
         
         obs2x_op, obs2x_func = self._setup_obsmap((_obs_ph, _processed_obs,), 
                                                   reuse = reuse, name = 'obs_%s'%(name));
+        
+        # act2x_op, act2x_func = self._setup_obsmap((_act_ph, _processed_act,), 
+        #                                           reuse = reuse, name = 'act_%s'%(name));
+        act2x_op = _processed_act;
+        
+        
         nobs2nx_op, _ = self._setup_obsmap(( _nobs_ph, _nprocessed_obs,), 
-                                           reuse = True, name = 'obs_%s'%(name));
-        
-        
-        act2x_op, act2x_func = self._setup_obsmap((_act_ph, _processed_act,), 
-                                                  reuse = reuse, name = 'act_%s'%(name));
+                                           reuse = True, name = 'obs_%s'%(name),
+                                           targetNet = targetNet);
                                                   
-        nact2x_op, _ = self._setup_obsmap((_nact_ph, _nprocessed_act,), 
-                                                  reuse = True, name = 'act_%s'%(name));
+        # nact2x_op, _ = self._setup_obsmap((_nact_ph, _nprocessed_act,), 
+        #                                           reuse = True, name = 'act_%s'%(name),
+        #                                           targetNet = True);
+        nact2x_op = _nprocessed_act;
         
         x2q_op, x2q_func = self._setup_x2qvalue((_obs_ph, obs2x_op, _act_ph, act2x_op), 
                                                 reuse = reuse, name = name);
                                                 
         nx2nq_op, _ = self._setup_x2qvalue((_nobs_ph, nobs2nx_op, _nact_ph, nact2x_op), 
-                                           reuse = False, name = 'n' + name,
-                                           targetNet = True);
+                                           reuse = False or not targetNet, name = 'n' + name,
+                                           targetNet = targetNet);
         
         return (obs2index_op, nobs2index_op, obs2index_func, 
                 obs2x_op, nobs2nx_op, obs2x_func, 
@@ -279,16 +299,25 @@ class DeepAgentContinuous(approximatedAgent):
                                                    'C1': 1,
                                                    'C2': 2}, name = 't1'):
         _obs_ph, _processed_obs = inputs;
+        
         def _inner_func(_setup_obsmap, _setup_x2qvalue):
+            @tf.function
             def __func(act, obs):
                 obs2x_op, _ = _setup_obsmap((obs, obs,), 
                                             reuse = True, name = 'obs_%s'%(name));
                 _processed_act = ((act - self.act_bounds[0]) / (self.act_bounds[1] - self.act_bounds[0]));
-                act2x_op, _ = _setup_obsmap((_processed_act, _processed_act,), 
-                                            reuse = True, name = 'act_%s'%(name));
+                # act2x_op, _ = _setup_obsmap((_processed_act, _processed_act,), 
+                #                             reuse = True, name = 'act_%s'%(name));
+                act2x_op = _processed_act;
+                
                 x2q_op, _ = _setup_x2qvalue((obs, obs2x_op, act, act2x_op), reuse = True, 
                                             name = 'PSO_x2q', targetNet = targetNet);
-                return tf.stop_gradient(x2q_op);
+                
+                # sum_ = tf.greater(tf.abs(_processed_act - 0.5), 0.5);
+                # x2q_op = tf.where(tf.reduce_any(sum_, axis = 1, keep_dims = True), 
+                #                   tf.ones_like(x2q_op) * -1e+10, x2q_op);
+                
+                return x2q_op;
             return __func
         
         def _inner_test_func(_setup_obsmap, _setup_x2qvalue):
@@ -305,17 +334,19 @@ class DeepAgentContinuous(approximatedAgent):
         func = _inner_func(self._setup_obsmap, self._setup_x2qvalue);
         global_particle, global_eval = p.build_batch_v4(func = func, 
                                                         y = _processed_obs, 
-                                                        bounds = bounds, maxiter = maxiter, 
+                                                        bounds = bounds, 
+                                                        maxiter = maxiter, 
                                                         batch_size = batch_size, 
                                                         k = k);
-        return tf.stop_gradient(tf.reshape(global_particle, shape = (batch_size, k, D,))), \
+        return tf.stop_gradient(global_particle), \
                 tf.stop_gradient(tf.reshape(global_eval, shape = (batch_size, k)));
     
     def _setup_countbased(self, x, name = 'obs2index', reuse = False):
         _obs_ph, _processed_obs = x;
         with tf.variable_scope("countbased", reuse = reuse):
             hashmatrix = tf.get_variable(name = "hash_matrix", shape = ((_obs_ph.shape[1], self.countbased_features)), 
-                                         initializer = tf.random_normal_initializer(seed = self.init_seed));
+                                         initializer = tf.random_normal_initializer(seed = self.init_seed),
+                                         dtype = def_dtype);
         obs2index_op = tf.sign(tf.matmul(_processed_obs, hashmatrix));
         return obs2index_op, tf_util.function(
                 inputs=[_obs_ph],
@@ -323,24 +354,85 @@ class DeepAgentContinuous(approximatedAgent):
                 updates=[]
                 );
     
+    @tf.function
+    def _lisht(x: tf.Tensor) -> tf.Tensor:
+        return tf.multiply(tf.abs(x), tf.nn.tanh(x));
     
-    def _setup_obsmap(self, x, reuse = False, name = 'obsmap'):
+    @tf.function
+    def _bent(x: tf.Tensor) -> tf.Tensor:
+        return tf.add(0.5 * (tf.pow(tf.square(x) + 1, 0.5) - 1), x);
+    
+    def get_activate_fn(self, act_fn):
+        if act_fn is None:
+            act_fn = None;
+        elif act_fn == 'tanh':
+            act_fn = tf.nn.tanh;
+        elif act_fn == 'leaky_relu':
+            act_fn = tf.nn.leaky_relu;
+        elif act_fn == 'relu':
+            act_fn = tf.nn.relu;
+        elif act_fn == 'elu':
+            act_fn = tf.nn.elu;
+        elif act_fn == 'mish':
+            # Mish: A Self Regularized Non-Monotonic Neural Activation Function.
+            act_fn = lambda x:  x * tf.nn.tanh(tf.nn.softplus(x));
+        elif act_fn == 'lisht':
+             # LiSHT: Non-Parameteric Linearly Scaled Hyperbolic Tangent Activation Function for Neural Networks.
+            act_fn = DeepAgentContinuous._lisht;
+        elif act_fn == 'bent':
+             # _bent
+            act_fn = DeepAgentContinuous._bent;
+        else:
+            act_fn = tf.nn.sigmoid;
+        return act_fn;
+    
+    def _setup_obsmap(self, x, reuse = False, name = 'obsmap', targetNet = False):
         _obs_ph, _processed_obs = x;
-        def create(_input, reuse = reuse):
-            action_out = tf_layers.flatten(_input);
-            for index, layer_size in enumerate(self.obsmap_layers):
-                action_out = tf_layers.fully_connected(action_out, num_outputs = layer_size, 
-                                                       activation_fn = None, 
-                                                       weights_initializer = initializers.xavier_initializer(seed = self.init_seed),
-                                                       scope = 'fc%s'%index, reuse = reuse,
-                                                       #weights_regularizer = tf.contrib.layers.l2_regularizer(0.01),
+        def create(_input, reuse = reuse, trainable = True):
+            # action_out = _input;
+            action_out = tf.layers.flatten(_input);
+            # tmp_ = tf.get_variable(name = 'pw_input', shape = ((1, _obs_ph.shape[1])),
+            #                         initializer = tf.ones_initializer(), 
+            #                         trainable = trainable,
+            #                         dtype = def_dtype);
+            # action_out = tf.multiply(action_out, tmp_);
+            # action_out = action_out / tf.reduce_sum(tmp_);
+            for index, (layer_size, act_fn) in enumerate(self.obsmap_layers):
+                act_fn = self.get_activate_fn(act_fn);
+                # tf.layers.dense
+                action_out = tf.layers.dense(action_out, layer_size, 
+                                                       # activation_fn = act_fn, 
+                                                       # weights_initializer = initializers.xavier_initializer(seed = self.init_seed),
+                                                       # weights_initializer = tf.zeros_initializer(),
+                                                       name = 'fc%s'%index, reuse = reuse,
                                                        );
+                
+                # action_out = tf_layers.fully_connected(action_out, num_outputs = layer_size, 
+                #                                        activation_fn = act_fn, 
+                #                                        weights_initializer = initializers.xavier_initializer(seed = self.init_seed),
+                #                                        # weights_initializer = tf.zeros_initializer(),
+                #                                        scope = 'fc%s'%index, reuse = reuse,
+                #                                        );
+                action_out = act_fn(action_out)
                 #action_out = tf_layers.layer_norm(action_out, center = True, scale = True, scope = 'norm%s'%index);
-                action_out = tf.nn.leaky_relu(action_out, name = 'relu%s'%index);
             return action_out;
         
+        
+        # if targetNet:
+        #     if self.target_network_update_freq > 0:
+        #         with tf.variable_scope("target_deepq", reuse = reuse):
+        #             with tf.variable_scope("obsmap_%s"%(name), reuse = reuse):
+        #                 obs2x_op = create(_processed_obs, trainable = False, reuse = reuse);
+        #                 obs2x_op = tf.stop_gradient(obs2x_op);
+        #     else:
+        #         with tf.variable_scope("deepq", reuse = reuse):
+        #             with tf.variable_scope("obsmap_%s"%(name), reuse = True):
+        #                 obs2x_op = create(_processed_obs);
+        #                 obs2x_op = tf.stop_gradient(obs2x_op);
+        # else:
+        #     with tf.variable_scope("deepq", reuse = reuse):
         with tf.variable_scope("obsmap_%s"%(name), reuse = reuse):
-            obs2x_op = create(_processed_obs);
+            obs2x_op = create(_processed_obs, reuse = reuse);
         return obs2x_op, tf_util.function(
                     inputs=[_obs_ph],
                     outputs=[obs2x_op],
@@ -350,40 +442,65 @@ class DeepAgentContinuous(approximatedAgent):
     def _setup_x2qvalue(self, x, reuse = False, name = 'x2qv', targetNet = False):
         _obs_ph, obs2x_op, _act_ph, act2x_op = x;
         def create(_input, trainable = True, reuse = False):
+            # obs2x_op, act2x_op = _input;
             action_out = tf.layers.flatten(_input);
-            for index, layer_size in enumerate(self.qnet_layers):
-                action_out = tf_layers.fully_connected(action_out, num_outputs = layer_size, 
-                                                       activation_fn = None, scope = 'fc%s'%index, 
-                                                       trainable = trainable, 
-                                                       weights_initializer = initializers.xavier_initializer(seed = self.init_seed), 
-                                                       reuse = reuse,
-                                                       #weights_regularizer = tf.contrib.layers.l2_regularizer(0.01),
-                                                       );
-                #action_out = tf_layers.layer_norm(action_out, center=True, 
-                                                  #scale=True, scope = 'norm%s'%index, trainable = trainable);
-                action_out = tf.nn.leaky_relu(action_out, name = 'relu%s'%index);
-            action_out = tf_layers.fully_connected(action_out, num_outputs = 1, 
-                                                   activation_fn = None,
-                                                   scope = 'output', trainable = trainable, 
-                                                   #weights_initializer = initializers.xavier_initializer(seed = self.init_seed), 
-                                                   reuse = reuse,);
+            # act2x_op = tf.layers.flatten(act2x_op);
+            for index, (layer_size, act_fn_name) in enumerate(self.qnet_layers):
+                act_fn = self.get_activate_fn(act_fn_name);
+                action_out = tf.layers.dense(action_out, layer_size, 
+                                             name = 'fc%s'%index, 
+                                             # trainable = trainable, 
+                                             reuse = reuse,);
+                action_out = act_fn(action_out, name = '%s-%s'%(act_fn_name, index))
+                                                  
+            action_out = tf.layers.dense(action_out, 1, 
+                                         name = 'output', 
+                                         # trainable = trainable, 
+                                          # kernel_initializer = tf.zeros_initializer(),
+                                          # kernel_initializer = tf.random_uniform_initializer(minval=-3e-3, maxval=3e-3, seed = self.init_seed),
+                                         reuse = reuse,);
             return action_out;
         
         
-        _input = obs2x_op + act2x_op;
-        #_input = tf.concat([obs2x_op, act2x_op], axis = 1);
-        
+        # _input = obs2x_op + act2x_op;
+        # _input = (obs2x_op, act2x_op);
         if targetNet:
             if self.target_network_update_freq > 0:
                 with tf.variable_scope("target_deepq", reuse = reuse):
+                    _input = tf.concat([obs2x_op, act2x_op], axis = 1);
+                    tmp_ = tf.get_variable(name = 'pw_input', shape = ((1, _input.shape[1])),
+                                            initializer = tf.constant_initializer(1e+0), 
+                                            trainable = False,
+                                            dtype = def_dtype);
+                    # obs2x_op = tf.multiply(obs2x_op, tmp_);
+                    # obs2x_op = obs2x_op / tf.reduce_sum(obs2x_op, axis = 1, keep_dims = True);
+                    # _input = tf.nn.leaky_relu(tf.multiply(_input, tmp_));
                     x2q_op = create(_input, trainable = False, reuse = reuse);
             else:
                 with tf.variable_scope("deepq", reuse = True):
+                    _input = tf.concat([obs2x_op, act2x_op], axis = 1);
+                    tmp_ = tf.get_variable(name = 'pw_input', shape = ((1, _input.shape[1])),
+                                            initializer = tf.constant_initializer(1e+0), 
+                                            trainable = True,
+                                            dtype = def_dtype);
+                    # obs2x_op = tf.multiply(obs2x_op, tmp_);
+                    # obs2x_op = obs2x_op / tf.reduce_sum(obs2x_op, axis = 1, keep_dims = True);
+                    # obs2x_op = tf.nn.leaky_relu(tf.multiply(obs2x_op, tmp_));
+                    # _input = tf.nn.leaky_relu(tf.multiply(_input, tmp_));
                     x2q_op = create(_input, trainable = True, reuse = True);
             x2q_op = tf.stop_gradient(x2q_op);
         else:
             with tf.variable_scope("deepq", reuse = reuse):
-                x2q_op = create(_input, reuse = reuse);
+                _input = tf.concat([obs2x_op, act2x_op], axis = 1);
+                tmp_ = tf.get_variable(name = 'pw_input', shape = ((1, _input.shape[1])),
+                                        initializer = tf.constant_initializer(1e+0), 
+                                        trainable = True,
+                                        dtype = def_dtype);
+                # obs2x_op = tf.multiply(obs2x_op, tmp_);
+                # obs2x_op = obs2x_op / tf.reduce_sum(obs2x_op, axis = 1, keep_dims = True);
+                # obs2x_op = tf.nn.leaky_relu(tf.multiply(obs2x_op, tmp_));
+                # _input = tf.nn.leaky_relu(tf.multiply(_input, tmp_));
+                x2q_op = create(_input, reuse = reuse, trainable = True);
                 
         return x2q_op, tf_util.function(
                     inputs=[_obs_ph, _act_ph],
@@ -404,27 +521,47 @@ class DeepAgentContinuous(approximatedAgent):
             #q_tp1 = self.nx2nq_op;
             
             q_tp1 = (1.0 - self._processed_done_mask_ph) * q_tp1;
+            print('q_tp1 shape', q_tp1)
             q_t_selected_target = self._processed_rew_ph + self.gamma * q_tp1;
             td_error = q_t_selected - tf.stop_gradient(q_t_selected_target);
             print('td_error gradients', tf.gradients(td_error, [self._obs_ph, self._act_ph, self._nobs_ph, self._nact_ph]))
             
-            errors = tf_util.huber_loss(td_error);
-            #errors = tf.square(td_error);
+            # errors = tf_util.huber_loss(td_error);
+            errors = tf_util.inv_huber_loss(td_error);
+            # errors = tf.math.abs(td_error);
+            # errors = tf.square(td_error);
             weighted_error = tf.reduce_mean(errors);
         
-            tf.summary.scalar("td_error", tf.reduce_mean(td_error));
-            tf.summary.scalar("loss", weighted_error);
+            _lr = tf.placeholder(def_dtype, name="learning_rate");
+            # self.optimizer = tf.train.AdamOptimizer(learning_rate = _lr, name = 'adam', beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8);
+            self.optimizer = tf.train.AdamOptimizer(learning_rate = _lr, name = 'adam');
+            # self.optimizer = tf.train.RMSPropOptimizer(learning_rate = _lr, name = 'rmsp');
             
-            optimizer = tf.train.AdamOptimizer(learning_rate = self.learning_rate, name = 'adam');
-            #optimizer = tf.train.RMSPropOptimizer(learning_rate = self.learning_rate, name = 'adam');
-            
-            gradients = optimizer.compute_gradients(weighted_error, var_list=q_func_vars);
+            gradients = self.optimizer.compute_gradients(weighted_error, var_list=q_func_vars);
+            # gradients = tf.where(tf.is_nan(gradients), tf.zeros_like(gradients), gradients);
             if self.grad_norm_clipping is not None:
+                print('+'*30);
+                print('grad layers')
                 for i, (grad, var) in enumerate(gradients):
                     print(var.name)
                     if grad is not None:
                         gradients[i] = (tf.clip_by_norm(grad, self.grad_norm_clipping), var);
-            optimize_expr = optimizer.apply_gradients(gradients);
+                        # gradients[i] = (tf.clip_by_value(grad, -self.grad_norm_clipping, self.grad_norm_clipping, name=None), var)
+                print('+'*30);
+            optimize_expr = self.optimizer.apply_gradients(gradients);
+            
+            
+            
+            gradients = tf.gradients(weighted_error, q_func_vars);
+            if self.grad_norm_clipping is not None:
+                gradients = [tf.clip_by_norm(grad, clip_norm = self.grad_norm_clipping) if grad is not None else grad for grad in gradients]
+            gradients = tf.concat(axis=0, values=[
+                tf.reshape(grad if grad is not None else tf.zeros_like(v), [tf_util.numel(v)])
+                for (v, grad) in zip(q_func_vars, gradients)])
+            
+            self.optimizer_outer = MpiAdam(var_list = q_func_vars, 
+                                      beta1=0.9, beta2=0.999, 
+                                      epsilon=1e-08, sess = self.sess);
             
             train = tf_util.function(
                 inputs=[
@@ -434,8 +571,10 @@ class DeepAgentContinuous(approximatedAgent):
                     self._nobs_ph,
                     self._nact_ph,
                     self._done_mask_ph,
+                    _lr,
                 ],
-                outputs=[td_error, weighted_error, q_t_selected, q_t_selected_target, gradients],
+                outputs=[td_error, weighted_error, self.nglobal_particle, 
+                         self.nglobal_eval, gradients],
                 updates=[optimize_expr]
             );
             return train;
@@ -461,7 +600,7 @@ class DeepAgentContinuous(approximatedAgent):
     
     def _setup_soft_update(self, tau = 1e-3):
         """Soft update model parameters.
-        θ_target = τ*θ_local + (1 - τ)*θ_target
+        �_target = �*�_local + (1 - �)*�_target
         Params
         ======
             local_model (PyTorch model): weights will be copied from
@@ -486,6 +625,8 @@ class DeepAgentContinuous(approximatedAgent):
             model_vars_gpu = tf.global_variables();
             model_cpu = {};
             for var in model_vars_gpu:
+                if var.name.startswith('swarm_intelligence'):
+                    continue;
                 model_cpu[var.name] = var.value().eval(session = self.sess);
             
         if file is None:
@@ -507,8 +648,9 @@ class DeepAgentContinuous(approximatedAgent):
             
             ops = [];
             for var in model_vars_gpu:
-                if var.name.startswith('swarm_intelligence'):
-                    continue;
                 if var.name in model_cpu.keys():
                     ops.append(var.assign(model_cpu[var.name], name = var.name[:-3]));
             self.sess.run(ops);
+            
+    def reset(self):
+        tf.reset_default_graph()

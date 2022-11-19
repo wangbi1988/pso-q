@@ -6,9 +6,9 @@ Created on Sun Jul 12 14:23:30 2020
 """
 
 
+from . import def_dtype;
 import numpy as np
 import tensorflow as tf
-
 from gym.spaces import Discrete, Box, MultiBinary, MultiDiscrete
 
 def observation_input(ob_space, batch_size=None, name='Ob', scale=False):
@@ -31,7 +31,7 @@ def observation_input(ob_space, batch_size=None, name='Ob', scale=False):
 
     elif isinstance(ob_space, Box):
         observation_ph = tf.placeholder(shape=(batch_size,) + ob_space.shape, dtype=ob_space.dtype, name=name)
-        processed_observations = tf.cast(observation_ph, tf.float32)
+        processed_observations = tf.cast(observation_ph, def_dtype)
         # rescale to [1, 0] if the bounds are defined
         if (scale and
            not np.any(np.isinf(ob_space.low)) and not np.any(np.isinf(ob_space.high)) and

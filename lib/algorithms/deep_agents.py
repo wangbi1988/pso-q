@@ -83,10 +83,10 @@ class DeepAgent(approximatedAgent):
         if output_graph:
             self.print_model();
             
-        self.episode_leng = []
-
-        self.name = name
-
+        self.episode_leng = [];
+        
+        self.name = name;
+            
     def print_model(self):
         with self.graph.as_default():
             slim.model_analyzer.analyze_vars(tf.trainable_variables(), print_info=True);

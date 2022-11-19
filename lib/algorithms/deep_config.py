@@ -5,25 +5,27 @@ Created on Thu Jul  9 15:57:36 2020
 @author: 王碧
 """
 
+from . import def_dtype;
 import tensorflow as tf;
 #import tensorflow_probability as tfp;
 import numpy as np;
 
 @tf.function
 def operator_max(x, **args):
-#    q_tp1 = tf.reduce_max(x, axis = 1);
-    return x;
+    q_tp1 = tf.reduce_max(x, axis = 1, keepdims = True);
+    return q_tp1;
 
 @tf.function
 def operator_expection(x, prob_ph, **args):
-    q_tp1 = tf.reduce_sum(tf.multiply(prob_ph, x), axis = 1);
+    q_tp1 = tf.reduce_sum(tf.multiply(prob_ph, x), axis = 1, keepdims = True);
     return q_tp1;
 
 @tf.function
 def operator_mellowmax(x, omega_ph, prob_ph, **args):
     c = tf.reduce_max(x, axis = 1, keepdims = True); 
     print(c)
-    y = c + tf.math.divide(tf.log(tf.reduce_sum(tf.multiply(prob_ph, tf.exp(omega_ph * (x - c))), axis = 1, keepdims = True)), omega_ph);
+    y = c + tf.math.divide(tf.log(tf.reduce_sum(tf.multiply(prob_ph, tf.exp(omega_ph * (x - c))), 
+                                                axis = 1, keepdims = True)), omega_ph);
     y = tf.reshape(y, (-1,))
     return y;
 
@@ -33,12 +35,14 @@ def judge_epsilon_greedy(x, eps_ph, **args):
     if len(vals.shape) < 2:
         vals = tf.reshape(vals, shape = (tf.shape(vals)[0], 1))
     batch_size, n_actions = vals.shape;
-    n_actions = tf.cast(n_actions, tf.float32);
-    probs = tf.multiply(vals, 0.);
+    n_actions = tf.cast(n_actions, def_dtype);
+    print(vals)
+    probs = tf.zeros_like(vals, dtype = def_dtype);
     probs = tf.add(probs, tf.math.divide(eps_ph, n_actions));
     maxq = tf.reduce_max(vals, axis = 1, keepdims = True);
     t = tf.greater_equal(vals, maxq);
-    tt = tf.add(probs, tf.math.divide(1 - eps_ph, tf.reduce_sum(tf.cast(t, dtype = tf.float32), axis = 1, keepdims = True)));
+    tt = tf.add(probs, tf.math.divide(1 - eps_ph, tf.reduce_sum(tf.cast(t, dtype = def_dtype), 
+                                                                axis = 1, keepdims = True)));
     true_fun = tf.where_v2(t, tt, probs);
     eps_ph = tf.reshape(eps_ph, (-1,))
     pred_probs = tf.where_v2(tf.less(eps_ph, 1), true_fun, probs);
@@ -64,10 +68,10 @@ class BasicDeepConfig(object):
         self._initialized = False;
         
     def _setup_hyperparams(self, x):
-        self.eps_ph = tf.placeholder(tf.float32, (), name = "eps_ph");
-        self.omega_ph = tf.placeholder(tf.float32, (), name = "omega_ph");
-        self.eta_ph = tf.placeholder(tf.float32, [x.shape[0], 1], name = "eta_ph");
-        self.prob_ph = tf.placeholder(tf.float32, [x.shape[0], x.shape[1]], name = "prob_ph");
+        self.eps_ph = tf.placeholder(def_dtype, (), name = "eps_ph");
+        self.omega_ph = tf.placeholder(def_dtype, (), name = "omega_ph");
+        self.eta_ph = tf.placeholder(def_dtype, [x.shape[0], 1], name = "eta_ph");
+        self.prob_ph = tf.placeholder(def_dtype, [x.shape[0], x.shape[1]], name = "prob_ph");
         
         self.str2hyperparams = {'eps_ph': self.eps_ph, 'omega_ph': self.omega_ph, 
                                 'eta_ph': self.eta_ph, 'prob_ph': self.prob_ph};
@@ -75,8 +79,8 @@ class BasicDeepConfig(object):
         self.prob_ph_default = np.ones((1, x.shape[1].value)) / x.shape[1].value;
         
 #        hesv
-        self.varsigma_ph = tf.placeholder(tf.float32, (), name = "varsigma_ph");
-        self.c_ph = tf.placeholder(tf.float32, (), name = "c_ph");
+        self.varsigma_ph = tf.placeholder(def_dtype, (), name = "varsigma_ph");
+        self.c_ph = tf.placeholder(def_dtype, (), name = "c_ph");
         
         self._initialized = True;
         
@@ -86,7 +90,9 @@ class BasicDeepConfig(object):
                 feed_dict[self.str2hyperparams[key]] = val;
         vals = sess.run(judge, feed_dict = feed_dict);
         if type(judge) in (list, tuple):
-            return (vals[i][0] for i in range(len(judge)));       
+            # return (vals[i][0] for i in range(len(judge)));  
+            # return [vals[i][0] for i in range(len(judge))];    
+            return vals[0], vals[1];       
         else:
             return vals;
     

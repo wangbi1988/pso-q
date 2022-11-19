@@ -54,16 +54,23 @@ class trajectory(object):
 class abstractAgent(object):
     @staticmethod
     def choice_v1(values, size, p):
-        x = np.random.rand();
-        cum = 0;
-        for i, t in enumerate(p):
+        x = np.random.rand(len(p));
+        cum = np.zeros_like(x);
+        idx = np.zeros_like(x) - 1;
+        for i, t in enumerate(np.transpose(p)):
             cum += t;
-            if x < cum:
+            # if x < cum:
+            #     break;
+            tmp = np.asarray((x >= 0) * (x - cum < 0), dtype = np.bool);
+            idx[tmp] = i;
+            x[tmp] = -1;
+            if all(x < 0):
                 break;
+            
         if isinstance(values, int):
-            return i;
+            return idx;
         elif hasattr(values, '__iter__'):
-            return values[i];
+            return values[:, idx];
         else:
             raise NotImplementedError();
     
